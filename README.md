@@ -27,7 +27,7 @@ options:
 ## Codec support
 
 | Codec   | Input | Output |
-|--------------------------|
+|---------|-------|--------|
 | FLAC    | Yes   | No     |
 | MP3     | Yes   | Yes    |
 | Opus    | Yes   | Yes    |
