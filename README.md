@@ -23,3 +23,22 @@ options:
   -l, --copy-lossy      don't transcode lossy sources
   -q, --quiet           suppress progress output
 ```
+
+## Codec support
+
+| Codec   | Input | Output |
+|--------------------------|
+| FLAC    | Yes   | No     |
+| MP3     | Yes   | Yes    |
+| Opus    | Yes   | Yes    |
+| Vorbis  | Yes   | No     |
+| AAC     | Yes   | No     |
+
+Codec support is controlled by the ```CODEC_TABLE``` global dictionary in
+```mkalttree```. See the comments above it for a description of the format and
+how to add codecs or change the transcoding command.
+
+## Requirements
+In its default configuration, this script requires:
+ - ffmpeg (with libmp3lame for MP3 support)
+ - opus-tools
