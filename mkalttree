@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+
+import os
+import argparse
+import threading
+import concurrent.futures
+import shutil
+import subprocess
+
+SRC_FILE = object()
+DST_FILE = object()
+
+# CODEC INFORMATION TABLE
+# Entry format:
+#
+#   codec-name: (primary-extn, [oth-extns], is-src, is-dst, lossy, conv-tbl)
+#
+# conv-tbl is an optional conversion table dictionary describing how to
+# convert files in a source codec (with name as the key). A key of '*' matches
+# any codec. The entry format is
+#
+#   src-codec-name: [cmdline-arg1, ...]
+#
+# A cmdline-arg that is SRC_FILE or DST_FILE is subsituted for the source or
+# destination file respectively.
+
+CODEC_TABLE = {
+    'FLAC':     ('flac', [],       True, False, False),
+    'MP3':      ('mp3',  [],       True, True,  True, {
+        '*':        ['ffmpegs', '-y', '-v', 'quiet', '-i', SRC_FILE,
+                     '-codec:a', 'libmp3lame', '-q:a', '3',
+                     #'-map_metadata', '0:s:0',
+                     DST_FILE]
+        }),
+    'Opus':     ('opus', [],       True, True,  True, {
+        'FLAC': ['opusenc', '--quiet', '--bitrate', '160', SRC_FILE, DST_FILE],
+        '*':    ['ffmpeg', '-y', '-v', 'quiet', '-i', SRC_FILE,
+                 '-codec:a', 'libopus', '-b:a', '160k', DST_FILE]
+        }),
+    'Vorbis':   ('ogg',  ['oga'],  True, False, True),
+    'AAC':      ('m4a',  ['aac'],  True, False, True)
+}
+
+# runtime codec data
+
+g_codecs = {}
+g_extn_to_codec = {}
+g_src_codecs = []
+g_dst_codecs = []
+
+class NoTranscoder(Exception):
+    """
+    Throw when we don't have a particular transcoder,
+    """
+    def __init__(self, src_codec, dst_codec):
+        self.src_codec = src_codec
+        self.dst_codec = dst_codec
+
+class Codec:
+    def __init__(self, name, extn, oth_extns, for_src, for_dst, lossy):
+        self.name, self.extension, self.for_src, self.for_dst, self.lossy = \
+            name, extn, for_src, for_dst, lossy
+        self.all_extensions = [self.extension] + oth_extns
+        self.conv_table = {}
+    def transcode_cmd(self, src_codec, src_path, dst_path):
+        key = src_codec if (src_codec in self.conv_table) else \
+              '*'       if ('*'       in self.conv_table) else None
+        if key is None:
+            raise NoTranscoder(src_codec, self)
+        cmd = [src_path.full_path if (t is SRC_FILE) else \
+               dst_path.full_path if (t is DST_FILE) else \
+               t for t in self.conv_table[key]]
+        return cmd
+
+# convert CODEC_TABLE to runtime structures
+
+for c_name, c_row in CODEC_TABLE.items():
+    c = Codec(c_name, *(c_row[:5]))
+    if c_name in g_codecs:
+        raise ValueError(f'Codec {c_name} already registered')
+    g_codecs[c_name.lower()] = c
+    for x in c.all_extensions:
+        if x in g_extn_to_codec:
+            raise ValueError(f'Extension {x} already registered')
+        g_extn_to_codec[x] = c
+    if c.for_src:
+        g_src_codecs.append(c)
+    if c.for_dst:
+        g_dst_codecs.append(c)
+for c_name, c_row in CODEC_TABLE.items():
+    if len(c_row) > 5:
+        c = g_codecs[c_name.lower()]
+        conv_tbl = c_row[5]
+        for tgt, func in conv_tbl.items():
+            tgt = tgt.lower()
+            if tgt in g_codecs:
+                c.conv_table[g_codecs[tgt]] = func
+            elif tgt == '*':
+                c.conv_table['*'] = func
+            else:
+                raise ValueError(f'Unknown conversion target {tgt}')
+
+# file path management
+
+def is_hidden_dir(dname):
+    """
+    Returns true if dname refers to a hidden directory.
+    """
+    return os.path.isdir(dname) and os.path.basename(dname)[0] == '.'
+
+class SplitPath():
+    def __init__(self, base, subdir, name, extn):
+        self.base = base
+        self.subdir = subdir
+        self.name = name
+        self.extn = extn
+        self.full_dir = os.path.join(self.base, self.subdir)
+        self.rel_path = os.path.join(self.subdir, self.name + '.' + self.extn)
+        self.full_path = os.path.join(self.base, self.rel_path)
+    def parse(base, idir, fstem):
+        absbase = os.path.abspath(base)
+        abspath = os.path.abspath(idir)
+        relpath = os.path.relpath(abspath, absbase)
+        name, extn = os.path.splitext(fstem)
+        if len(extn) > 0:
+            extn = extn[1:]
+        return SplitPath(absbase, relpath, name, extn)
+    def ensure_dirs(self):
+        os.makedirs(self.full_dir, exist_ok=True)
+    def rebase(self, new_base, new_extn):
+        return SplitPath(new_base, self.subdir, self.name, new_extn)
+    def classify(self):
+        codec = None
+        is_cover = False
+        if self.extn in g_extn_to_codec:
+            codec = g_extn_to_codec[self.extn]
+        elif self.extn.lower() in ['jpg', 'jpeg'] and \
+             self.name.lower() == 'cover':
+            is_cover = True
+        return is_cover, codec
+
+# runtime parameters
+
+g_dst_codec = None
+g_src_base = None
+g_dst_base = None
+
+g_n_up_to_date = 0
+g_n_copied = 0
+g_n_transcoded = 0
+g_n_failed = 0
+
+# thread-safe logging
+
+g_msg_lock = threading.Lock()
+
+def log_msg(msg, end='\n'):
+    if args.quiet:
+        return
+    g_msg_lock.acquire()
+    print(msg, end=end)
+    g_msg_lock.release()
+
+# subtasks
+
+class MkAltTask():
+    """
+    A low-level task holder.
+    """
+    def __init__(self, src_path, dst_path):
+        self.src_path = src_path
+        self.dst_path = dst_path
+    def run(self):
+        return True
+
+class MkAltUpToDate(MkAltTask):
+    def __init__(self, src_path, dst_path):
+        super().__init__(src_path, dst_path)
+
+class MkAltCopy(MkAltTask):
+    def __init__(self, src_path, dst_path):
+        super().__init__(src_path, dst_path)
+    def run(self):
+        global g_n_copied
+        log_msg(f'{self.src_path.rel_path}: Copy')
+        if not args.dry_run:
+            self.dst_path.ensure_dirs()
+            shutil.copyfile(self.src_path.full_path,
+                            self.dst_path.full_path)
+        g_n_copied += 1
+        return True
+
+class MkAltTranscode(MkAltTask):
+    def __init__(self, src_path, dst_path, src_codec, dst_codec):
+        super().__init__(src_path, dst_path)
+        self.src_codec = src_codec
+        self.dst_codec = dst_codec
+        self.cmdline = dst_codec.transcode_cmd(src_codec, src_path, dst_path)
+    def run(self):
+        global g_n_failed, g_n_transcoded
+        srp = self.src_path.rel_path
+        log_msg(f'{srp}: {self.src_codec.name} -> {self.dst_codec.name}')
+        if not args.dry_run:
+            self.dst_path.ensure_dirs()
+            try:
+                subprocess.run(self.cmdline, check=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+            except:
+                if os.path.is_file(self.dst_path.full_path):
+                    os.remove(self.dst_path.full_path)
+                log_msg(f'{srp}: transcode failed')
+                g_n_failed += 1
+                return False
+        g_n_transcoded += 1
+        return True
+
+def run_task(t):
+    return t.run()
+
+def make_task(src_path):
+    """
+    Makes a task from the file in src_path.
+    """
+    global g_n_up_to_date, g_n_failed
+    is_cover, src_codec = src_path.classify()
+    just_copy = False
+    if is_cover and args.no_covers:
+        return None
+    if not is_cover and src_codec is None:
+        return None # unsupported file
+    dst_extn = ''
+    if is_cover or src_codec is g_dst_codec or \
+       (args.copy_lossy and src_codec.lossy and g_dst_codec.lossy):
+        dst_extn = src_path.extn
+        just_copy = True
+    else:
+        dst_extn = g_dst_codec.extension
+    dst_path = src_path.rebase(g_dst_base, dst_extn)
+    # check if file needs updating
+    src_abs = src_path.full_path
+    dst_abs = dst_path.full_path
+    if not args.force and os.path.isfile(dst_abs) and \
+       os.path.getmtime(src_abs) < os.path.getmtime(dst_abs):
+        return MkAltUpToDate(src_path, dst_path)
+    if just_copy:
+        return MkAltCopy(src_path, dst_path)
+    else:
+        return MkAltTranscode(src_path, dst_path,
+                              src_codec, g_dst_codec)
+
+def walk_files(base):
+    """
+    Iterates over all files specified in the job, omitting directories that
+    are hidden or contain an .exclude file (unless ignored).
+    """
+    for path, dirnames, filenames in os.walk(base):
+        if is_hidden_dir(path) or \
+           (not args.ignore_exclude and '.exclude' in filenames):
+            dirnames.clear()
+        else:
+            for fn in filenames:
+                yield SplitPath.parse(base, path, fn)
+
+# process command line arguments
+
+parser = argparse.ArgumentParser(
+    description='Transcodes a tree of audio files')
+parser.add_argument('codec',
+    choices=[c.name.lower() for c in g_dst_codecs],
+    help='output codec')
+parser.add_argument('srcdir', metavar='SRCDIR', type=str,
+    help='source base directory')
+parser.add_argument('dstdir', metavar='DESTDIR', type=str,
+    help='destination base directory')
+parser.add_argument('-c', '--no-covers', action='store_true',
+    help='don\'t copy cover art files')
+parser.add_argument('-f', '--force', action='store_true',
+    help='also process up-to-date files')
+parser.add_argument('-X', '--ignore-exclude', action='store_true',
+    help='ignore .exclude files')
+parser.add_argument('-j', '--jobs', metavar='PROCESSES', type=int,
+    help='number of processes to spawn')
+parser.add_argument('-n', '--dry-run', action='store_true',
+    help='don\'t actually produce files')
+parser.add_argument('-l', '--copy-lossy', action='store_true',
+    help='don\'t transcode lossy sources')
+parser.add_argument('-q', '--quiet', action='store_true',
+    help='suppress progress output')
+args = parser.parse_args()
+g_dst_codec = g_codecs[args.codec.lower()]
+g_src_base = os.path.abspath(args.srcdir)
+g_dst_base = os.path.abspath(args.dstdir)
+if not os.path.isdir(g_src_base):
+    parser.error(f'Directory {args.src_base} does not exist')
+if not os.path.isdir(g_dst_base):
+    parser.error(f'Directory {args.dst_base} does not exist')
+
+# collect tasks and start threads to oversee jobs
+
+# use 1-thread pool for copies so we don't stall the transcode pool
+cp_exec = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+tc_exec = concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs)
+n_tasks = 0
+try:
+    log_msg('Scanning...')
+    cp_tasks = []
+    tc_tasks = []
+    for f in walk_files(g_src_base):
+        if n_tasks % 10 == 0:
+            log_msg(f'Found {n_tasks} tasks', end='\r')
+        try:
+            t = make_task(f)
+        except NoTranscoder:
+            log_msg('f{f.rel_path}: No transcoder')
+            g_n_failed += 1
+        else:
+            if isinstance(t, MkAltUpToDate):
+                g_n_up_to_date += 1
+            elif isinstance(t, MkAltCopy):
+                cp_tasks.append(t)
+                n_tasks += 1
+            elif isinstance(t, MkAltTranscode):
+                tc_tasks.append(t)
+                n_tasks += 1
+    log_msg(f'Processing {n_tasks} files')
+    cp_exec.map(run_task, cp_tasks)
+    tc_exec.map(run_task, tc_tasks)
+    cp_exec.shutdown()
+    tc_exec.shutdown()
+except KeyboardInterrupt:
+    cp_exec.shutdown(wait=False, cancel_futures=True)
+    tc_exec.shutdown(wait=False, cancel_futures=True)
+    log_msg(f'Finishing running tasks...')
+
+# summarise
+
+if not args.quiet:
+    print('Activity summary:')
+    print(f'{g_n_up_to_date} up-to-date, {g_n_copied} copied, ' + \
+          f'{g_n_transcoded} transcoded, {g_n_failed} failed')
