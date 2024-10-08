@@ -3,7 +3,7 @@ Takes a tree of audio files (typically FLACs) and clones it into another
 directory, transcoded to a target codec. Converts multiple files in parallel.
 
 ```
-usage: mkalttree.py [-h] [-c] [-f] [-X] [-j PROCESSES] [-n] [-l] [-q] {mp3,opus} SRCDIR DESTDIR
+usage: mkalttree [-h] [-c] [-f] [-X] [-j PROCESSES] [-n] [-l] [-q] {mp3,opus} SRCDIR DESTDIR
 
 Transcodes a tree of audio files
 
