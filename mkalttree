@@ -13,7 +13,7 @@ DST_FILE = object()
 # CODEC INFORMATION TABLE
 # Entry format:
 #
-#   codec-name: (primary-extn, [oth-extns], is-src, is-dst, lossy, conv-tbl)
+#   codec-name: (extensions, is-src, is-dst, lossy[, conv-tbl])
 #
 # conv-tbl is an optional conversion table dictionary describing how to
 # convert files in a source codec (with name as the key). A key of '*' matches
@@ -25,21 +25,39 @@ DST_FILE = object()
 # destination file respectively.
 
 CODEC_TABLE = {
-    'FLAC':     ('flac', [],       True, False, False),
-    'MP3':      ('mp3',  [],       True, True,  True, {
-        '*':        ['ffmpegs', '-y', '-v', 'quiet', '-i', SRC_FILE,
-                     '-codec:a', 'libmp3lame', '-q:a', '3',
-                     #'-map_metadata', '0:s:0',
-                     DST_FILE]
+    'FLAC':     ('flac',
+                 True,
+                 False,
+                 False),
+    'MP3':      ('mp3',
+                 True,
+                 True,
+                 True,
+        {
+        '*':    ['ffmpeg', '-y', '-v', 'quiet', '-i', SRC_FILE,
+                 '-codec:a', 'libmp3lame', '-q:a', '3', DST_FILE]
         }),
-    'Opus':     ('opus', [],       True, True,  True, {
+
+    'Opus':     ('opus',
+                 True,
+                 True,
+                 True,
+        {
         'FLAC': ['opusenc', '--quiet', '--bitrate', '160', SRC_FILE, DST_FILE],
         '*':    ['ffmpeg', '-y', '-v', 'quiet', '-i', SRC_FILE,
                  '-codec:a', 'libopus', '-b:a', '160k', DST_FILE]
         }),
-    'Vorbis':   ('ogg',  ['oga'],  True, False, True),
-    'AAC':      ('m4a',  ['aac'],  True, False, True)
-}
+
+    'Vorbis':   (['ogg', 'oga'],
+                 True,
+                 False,
+                 True),
+
+    'AAC':      (['m4a', 'aac'],
+                 True,
+                 False,
+                 True)
+    }
 
 # runtime codec data
 
@@ -57,10 +75,11 @@ class NoTranscoder(Exception):
         self.dst_codec = dst_codec
 
 class Codec:
-    def __init__(self, name, extn, oth_extns, for_src, for_dst, lossy):
-        self.name, self.extension, self.for_src, self.for_dst, self.lossy = \
-            name, extn, for_src, for_dst, lossy
-        self.all_extensions = [self.extension] + oth_extns
+    def __init__(self, name, params):
+        self.name = name
+        self.extns, self.is_src, self.is_dst, self.lossy = params[:4]
+        if type(self.extns) is not list:
+            self.extns = [self.extns]
         self.conv_table = {}
     def transcode_cmd(self, src_codec, src_path, dst_path):
         key = src_codec if (src_codec in self.conv_table) else \
@@ -75,22 +94,22 @@ class Codec:
 # convert CODEC_TABLE to runtime structures
 
 for c_name, c_row in CODEC_TABLE.items():
-    c = Codec(c_name, *(c_row[:5]))
+    c = Codec(c_name, c_row)
     if c_name in g_codecs:
         raise ValueError(f'Codec {c_name} already registered')
     g_codecs[c_name.lower()] = c
-    for x in c.all_extensions:
+    for x in c.extns:
         if x in g_extn_to_codec:
             raise ValueError(f'Extension {x} already registered')
         g_extn_to_codec[x] = c
-    if c.for_src:
+    if c.is_src:
         g_src_codecs.append(c)
-    if c.for_dst:
+    if c.is_dst:
         g_dst_codecs.append(c)
 for c_name, c_row in CODEC_TABLE.items():
-    if len(c_row) > 5:
+    if len(c_row) > 4:
         c = g_codecs[c_name.lower()]
-        conv_tbl = c_row[5]
+        conv_tbl = c_row[4]
         for tgt, func in conv_tbl.items():
             tgt = tgt.lower()
             if tgt in g_codecs:
@@ -236,7 +255,7 @@ def make_task(src_path):
         dst_extn = src_path.extn
         just_copy = True
     else:
-        dst_extn = g_dst_codec.extension
+        dst_extn = g_dst_codec.extns[0]
     dst_path = src_path.rebase(g_dst_base, dst_extn)
     # check if file needs updating
     src_abs = src_path.full_path
@@ -313,7 +332,7 @@ try:
         try:
             t = make_task(f)
         except NoTranscoder:
-            log_msg('f{f.rel_path}: No transcoder')
+            log_msg(f'{f.rel_path}: No transcoder')
             g_n_failed += 1
         else:
             if isinstance(t, MkAltUpToDate):
